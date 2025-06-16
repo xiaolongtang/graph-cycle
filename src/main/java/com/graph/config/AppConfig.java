@@ -14,6 +14,7 @@ public class AppConfig {
     private static final Logger logger = LoggerFactory.getLogger(AppConfig.class);
     private static final Properties properties = new Properties();
     private static DataSource dataSource;
+    private static String primaryKeyColumn; // Added for primary key column name
 
     static {
         try (InputStream input = AppConfig.class.getClassLoader().getResourceAsStream("application.properties")) {
@@ -21,6 +22,11 @@ public class AppConfig {
                 throw new RuntimeException("Unable to find application.properties");
             }
             properties.load(input);
+            // Initialize other properties before dataSource, if any depend on them
+            primaryKeyColumn = properties.getProperty("database.primarykey.column");
+            // Ensure critical properties like primaryKeyColumn are checked if necessary,
+            // or rely on consuming code to check (as CycleFinder does).
+
             initializeDataSource();
         } catch (IOException e) {
             logger.error("Failed to load configuration", e);
@@ -86,5 +92,9 @@ public class AppConfig {
     }
     public static String getCsvFilename() {
         return properties.getProperty("output.csv.filename", "graph_data.csv");
+    }
+
+    public static String getPrimaryKeyColumn() {
+        return primaryKeyColumn;
     }
 }

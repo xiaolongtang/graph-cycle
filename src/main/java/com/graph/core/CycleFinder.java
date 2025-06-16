@@ -93,113 +93,235 @@ public class CycleFinder {
 
     private void loadFromCsv() throws IOException {
         String csvFilename = AppConfig.getInputCsvFilename();
-        int batchSize = AppConfig.getBatchSize();
-        List<String> lines = new ArrayList<>();
-        
-        // 读取CSV文件
-        try (BufferedReader reader = new BufferedReader(new FileReader(csvFilename))) {
-            String line;
-            // 跳过头部
-            reader.readLine();
-            
-            while ((line = reader.readLine()) != null) {
-                lines.add(line);
-            }
-        }
+        // Use AppConfig.getBatchSize() as the number of lines to read into one chunk for processing
+        int processingChunkSize = AppConfig.getBatchSize();
 
-        // 并行处理数据
         int numThreads = AppConfig.getThreadPoolSize();
         ExecutorService loadExecutor = Executors.newFixedThreadPool(numThreads);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        List<String> lineChunk = new ArrayList<>(processingChunkSize);
+        long linesReadCounter = 0; // Optional: for logging approximate lines read
 
-        for (int i = 0; i < lines.size(); i += batchSize) {
-            final int start = i;
-            final int end = Math.min(start + batchSize, lines.size());
-            List<String> batch = lines.subList(start, end);
+        logger.info("Starting CSV load from '{}' with chunk size {}.", csvFilename, processingChunkSize);
 
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                for (String line : batch) {
-                    String[] parts = line.split(",");
-                    if (parts.length >= 2) {
-                        try {
-                            long source = Long.parseLong(parts[0].trim());
-                            long target = Long.parseLong(parts[1].trim());
-                            
-                            adjacencyList.computeIfAbsent(source, k -> ConcurrentHashMap.newKeySet()).add(target);
-                            adjacencyList.computeIfAbsent(target, k -> ConcurrentHashMap.newKeySet());
-                        } catch (NumberFormatException e) {
-                            logger.error("Error parsing line: {}", line, e);
-                        }
-                    }
+        try (BufferedReader reader = new BufferedReader(new FileReader(csvFilename))) {
+            String line;
+            // Skip header if necessary - assuming first line is header
+            String header = reader.readLine();
+            if (header == null) {
+                logger.warn("CSV file is empty or header is missing: {}", csvFilename);
+                return;
+            }
+            logger.info("CSV Header: {}", header);
+
+            while ((line = reader.readLine()) != null) {
+                linesReadCounter++;
+                lineChunk.add(line);
+                if (lineChunk.size() >= processingChunkSize) {
+                    submitCsvChunkForProcessing(lineChunk, loadExecutor, futures);
+                    lineChunk = new ArrayList<>(processingChunkSize); // Reset for the next chunk
                 }
-            }, loadExecutor);
+            }
             
-            futures.add(future);
-        }
+            // Process any remaining lines in the last partial chunk
+            if (!lineChunk.isEmpty()) {
+                submitCsvChunkForProcessing(lineChunk, loadExecutor, futures);
+            }
 
-        try {
+            logger.info("All CSV chunks submitted for processing. Total lines read (approx, excluding header): {}. Waiting for completion...", linesReadCounter);
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            logger.info("All CSV data processed successfully.");
+
+        } catch (IOException e) {
+            logger.error("Error reading CSV file: {}", csvFilename, e);
+            // If an IO error occurs, pending tasks might still be running.
+            // The executor shutdown in finally will handle them.
+            throw e;
+        } catch (Exception e) {
+            // Catches exceptions from CompletableFuture.allOf().join() such as CompletionException
+            logger.error("Error processing CSV data or waiting for tasks to complete", e);
+            if (e instanceof CompletionException && e.getCause() != null) {
+                throw new IOException("Failed during CSV data processing: " + e.getCause().getMessage(), e.getCause());
+            }
+            throw new IOException("Failed during CSV data processing: " + e.getMessage(), e);
         } finally {
             loadExecutor.shutdown();
+            try {
+                if (!loadExecutor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    logger.warn("CSV load executor did not terminate gracefully, forcing shutdown.");
+                    loadExecutor.shutdownNow();
+                } else {
+                    logger.info("CSV load executor terminated gracefully.");
+                }
+            } catch (InterruptedException e) {
+                logger.error("Interrupted while waiting for CSV load executor to terminate.", e);
+                loadExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
-        
-        logger.info("Loaded {} lines from CSV file", lines.size());
+        logger.info("Finished loading data from CSV file: {}", csvFilename);
+    }
+
+    private void submitCsvChunkForProcessing(List<String> chunkToProcess,
+                                             ExecutorService executor,
+                                             List<CompletableFuture<Void>> futuresList) {
+        // Pass a copy of the list to the async task to prevent modification issues if chunkToProcess were cleared instead of reassigned.
+        List<String> batchForTask = new ArrayList<>(chunkToProcess);
+        logger.debug("Submitting CSV chunk of size {} for processing.", batchForTask.size());
+
+        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+            int successfullyProcessedLines = 0;
+            for (String fileLine : batchForTask) {
+                String[] parts = fileLine.split(","); // Assuming default comma delimiter
+                if (parts.length >= 2) {
+                    try {
+                        long source = Long.parseLong(parts[0].trim());
+                        long target = Long.parseLong(parts[1].trim());
+
+                        adjacencyList.computeIfAbsent(source, k -> ConcurrentHashMap.newKeySet()).add(target);
+                        adjacencyList.computeIfAbsent(target, k -> ConcurrentHashMap.newKeySet()); // Ensure target node exists
+                        successfullyProcessedLines++;
+                    } catch (NumberFormatException e) {
+                        logger.error("Error parsing number in CSV line: '{}'. Skipping line.", fileLine, e);
+                    } catch (Exception e) {
+                        logger.error("Unexpected error processing CSV line: '{}'. Skipping line.", fileLine, e);
+                    }
+                } else {
+                    logger.warn("Skipping malformed CSV line (expected at least 2 parts): '{}'", fileLine);
+                }
+            }
+            logger.debug("Finished processing CSV chunk. Successfully processed {}/{} lines.", successfullyProcessedLines, batchForTask.size());
+        }, executor);
+
+        futuresList.add(future);
     }
 
     private void loadFromDatabase() throws SQLException {
-        // 原有的数据库加载代码
-        String countSql = String.format("SELECT COUNT(*) FROM %s", tableName);
-        String sql = String.format("SELECT %s, %s FROM %s WHERE ROWNUM >= ? AND ROWNUM < ?", 
-            sourceColumn, targetColumn, tableName);
-        long totalRows;
-        
-        try (Connection conn = AppConfig.getDataSource().getConnection();
-             PreparedStatement countStmt = conn.prepareStatement(countSql);
-             ResultSet countRs = countStmt.executeQuery()) {
-            countRs.next();
-            totalRows = countRs.getLong(1);
+        // Keyset pagination: Requires a unique, ordered column (e.g., primary key)
+        // Assume AppConfig.getPrimaryKeyColumn() provides the name of this column, e.g., "ID"
+        // This column must be of a type that can be ordered, e.g., NUMBER, TIMESTAMP.
+        // For this example, we assume it's a Long.
+        String primaryKeyColumnName = AppConfig.getPrimaryKeyColumn();
+        if (primaryKeyColumnName == null || primaryKeyColumnName.trim().isEmpty()) {
+            logger.error("Primary key column name is not configured. Cannot use keyset pagination.");
+            throw new SQLException("Primary key column name not configured.");
         }
 
-        // 使用配置文件中的batch.size
+        String sql = String.format(
+            "SELECT %s, %s, %s FROM (" +
+            "  SELECT inner_select.%s, inner_select.%s, inner_select.%s " +
+            "  FROM (SELECT %s, %s, %s FROM %s WHERE %s > ? ORDER BY %s) inner_select " +
+            "  WHERE ROWNUM <= ?" +
+            ")",
+            sourceColumn, targetColumn, primaryKeyColumnName, // Outer select columns
+            sourceColumn, targetColumn, primaryKeyColumnName, // Inner select columns (repeated for clarity in sub-sub-query)
+            sourceColumn, targetColumn, primaryKeyColumnName, // Columns for the innermost select
+            tableName,             // Table name
+            primaryKeyColumnName,  // WHERE primaryKeyColumnName > ?
+            primaryKeyColumnName,  // ORDER BY primaryKeyColumnName
+            // batchSize is the second parameter for ROWNUM <= ?
+        );
+        logger.info("Using keyset pagination SQL: {}", sql);
+
+        long lastSeenPkValue = 0L; // Initial value for PK > ? (assuming PKs are positive)
+                                   // Adjust if PK can be 0 or negative, or use a different first query.
+
         int batchSize = AppConfig.getBatchSize();
-        int numThreads = AppConfig.getThreadPoolSize();
+        int numThreads = AppConfig.getThreadPoolSize(); // For processing loaded data
         ExecutorService loadExecutor = Executors.newFixedThreadPool(numThreads);
         List<CompletableFuture<Void>> futures = new ArrayList<>();
+        boolean moreDataToFetch = true;
 
-        for (long start = 1; start <= totalRows; start += batchSize) {
-            final long batchStart = start;
-            final long batchEnd = Math.min(start + batchSize, totalRows + 1);
-            
-            CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                try (Connection conn = AppConfig.getDataSource().getConnection();
-                     PreparedStatement pstmt = conn.prepareStatement(sql)) {
-                    pstmt.setLong(1, batchStart);
-                    pstmt.setLong(2, batchEnd);
-                    
-                    try (ResultSet rs = pstmt.executeQuery()) {
-                        while (rs.next()) {
-                            long source = rs.getLong(1);
-                            long target = rs.getLong(2);
-                            
-                            adjacencyList.computeIfAbsent(source, k -> ConcurrentHashMap.newKeySet()).add(target);
-                            adjacencyList.computeIfAbsent(target, k -> ConcurrentHashMap.newKeySet());
+        logger.info("Starting database load with keyset pagination. Batch size: {}", batchSize);
+
+        while (moreDataToFetch) {
+            final long currentLastSeenPkValue = lastSeenPkValue; // Effective final for lambda
+            List<Map.Entry<Long, Long>> batchData = new ArrayList<>();
+            long maxPkInBatch = -1L; // Initialize to a value lower than any expected PK in the batch
+            int rowCountInBatch = 0;
+
+            // Log the attempt to fetch a batch
+            logger.debug("Fetching batch with {} > {}", primaryKeyColumnName, currentLastSeenPkValue);
+
+            try (Connection conn = AppConfig.getDataSource().getConnection();
+                 PreparedStatement pstmt = conn.prepareStatement(sql)) {
+
+                pstmt.setLong(1, currentLastSeenPkValue); // For WHERE primaryKeyColumnName > ?
+                pstmt.setInt(2, batchSize);              // For ROWNUM <= ?
+
+                try (ResultSet rs = pstmt.executeQuery()) {
+                    while (rs.next()) {
+                        rowCountInBatch++;
+                        long source = rs.getLong(sourceColumn); // Use column names for robustness
+                        long target = rs.getLong(targetColumn);
+                        long currentPk = rs.getLong(primaryKeyColumnName);
+
+                        batchData.add(new java.util.AbstractMap.SimpleImmutableEntry<>(source, target));
+
+                        if (currentPk > maxPkInBatch) {
+                            maxPkInBatch = currentPk;
                         }
                     }
-                } catch (SQLException e) {
-                    logger.error("Error loading batch data", e);
-                    throw new CompletionException(e);
                 }
-            }, loadExecutor);
+            } catch (SQLException e) {
+                logger.error("Error loading batch data with keyset pagination (PK > {})", currentLastSeenPkValue, e);
+                // Propagate the exception to stop the process if a batch fails.
+                // Depending on requirements, partial processing could be allowed, but generally, it's safer to stop.
+                throw new CompletionException(e);
+            }
             
-            futures.add(future);
+            logger.debug("Batch fetched with {} rows. Max PK in batch: {}", rowCountInBatch, maxPkInBatch);
+
+            if (rowCountInBatch > 0 && !batchData.isEmpty()) {
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    logger.debug("Processing batch of {} entries.", batchData.size());
+                    for (Map.Entry<Long, Long> entry : batchData) {
+                        long source = entry.getKey();
+                        long target = entry.getValue();
+                        adjacencyList.computeIfAbsent(source, k -> ConcurrentHashMap.newKeySet()).add(target);
+                        adjacencyList.computeIfAbsent(target, k -> ConcurrentHashMap.newKeySet());
+                    }
+                    logger.debug("Finished processing batch of {} entries.", batchData.size());
+                }, loadExecutor);
+                futures.add(future);
+            }
+
+            if (rowCountInBatch < batchSize) {
+                moreDataToFetch = false; // This was the last batch
+                logger.info("Last batch fetched ({} rows, less than batch size {}). No more data.", rowCountInBatch, batchSize);
+            } else if (rowCountInBatch == 0) {
+                moreDataToFetch = false; // No data found in this iteration
+                logger.info("No rows returned in this batch. Assuming end of data.");
+            } else {
+                lastSeenPkValue = maxPkInBatch; // Update for the next iteration's WHERE clause
+                logger.debug("Continuing to next batch. Next {} > {}", primaryKeyColumnName, lastSeenPkValue);
+            }
         }
 
+        logger.info("All database batches scheduled for processing. Waiting for completion...");
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            // 数据加载完成后保存到CSV
+            logger.info("All batch processing completed.");
+            // Data loaded, now save to CSV if needed (as per original logic)
             saveToCSV();
+        } catch (Exception e) {
+            logger.error("Error during parallel processing of loaded data or saving to CSV", e);
+            // If CompletionException, unwrap it
+            if (e instanceof CompletionException && e.getCause() != null) {
+                throw new SQLException("Failed during data processing after load: " + e.getCause().getMessage(), e.getCause());
+            }
+            throw new SQLException("Failed during data processing after load: " + e.getMessage(), e);
         } finally {
             loadExecutor.shutdown();
+            try {
+                if (!loadExecutor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    loadExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                loadExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+            logger.info("Load executor shut down.");
         }
     }
 
