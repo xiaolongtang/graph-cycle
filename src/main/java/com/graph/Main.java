@@ -23,8 +23,23 @@ public class Main {
         logger.info("Total nodes processed: {}", finder.getProcessedNodes());
         
         // 输出所有找到的环
-        finder.getCycles().forEach(cycle -> 
-            logger.info("Cycle: {}", String.join(" -> ", cycle.stream().map(String::valueOf).toArray(String[]::new)))
-        );
+        logger.info("Logging found cycles..."); // Added a header for this section
+        finder.getCycles().forEach(cycle -> {
+            if (cycle == null || cycle.isEmpty()) {
+                logger.info("Cycle: (empty or null cycle)");
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (Long nodeId : cycle) {
+                if (!first) {
+                    sb.append(" -> ");
+                }
+                sb.append(nodeId);
+                first = false;
+            }
+            logger.info("Cycle: {}", sb.toString());
+        });
+        logger.info("Finished logging cycles."); // Added a footer for this section
     }
 } 
