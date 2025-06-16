@@ -33,10 +33,21 @@ public class AppConfig {
         config.setJdbcUrl(properties.getProperty("db.url"));
         config.setUsername(properties.getProperty("db.username"));
         config.setPassword(properties.getProperty("db.password"));
-        config.setMaximumPoolSize(Integer.parseInt(properties.getProperty("db.pool.size", "10")));
-        config.setMinimumIdle(Integer.parseInt(properties.getProperty("db.pool.min.idle", "5")));
+        
+        // 增加连接池大小以支持并行加载
+        config.setMaximumPoolSize(Integer.parseInt(properties.getProperty("db.pool.size", "20")));
+        config.setMinimumIdle(Integer.parseInt(properties.getProperty("db.pool.min.idle", "10")));
+        
+        // 优化连接池配置
         config.setIdleTimeout(Long.parseLong(properties.getProperty("db.pool.idle.timeout", "300000")));
-        config.setConnectionTimeout(Long.parseLong(properties.getProperty("db.pool.connection.timeout", "20000")));
+        config.setConnectionTimeout(Long.parseLong(properties.getProperty("db.pool.connection.timeout", "30000")));
+        config.setMaxLifetime(Long.parseLong(properties.getProperty("db.pool.max.lifetime", "1800000")));
+        
+        // 添加性能优化配置
+        config.addDataSourceProperty("cachePrepStmts", "true");
+        config.addDataSourceProperty("prepStmtCacheSize", "250");
+        config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
+        config.addDataSourceProperty("useServerPrepStmts", "true");
         
         dataSource = new HikariDataSource(config);
     }
@@ -65,4 +76,15 @@ public class AppConfig {
     public static String getTargetColumn() {
         return properties.getProperty("column.target", "target_id");
     }
-} 
+
+    public static String getDataSourceType() {
+        return properties.getProperty("data.source.type", "database");
+    }
+
+    public static String getInputCsvFilename() {
+        return properties.getProperty("input.csv.filename", "graph_data.csv");
+    }
+    public static String getCsvFilename() {
+        return properties.getProperty("output.csv.filename", "graph_data.csv");
+    }
+}
